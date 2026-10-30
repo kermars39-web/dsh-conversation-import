@@ -98,6 +98,14 @@ async function handleRequest(ctx, env, req, res) {
     ? url.pathname.slice(ROUTE_PREFIX.length) || '/'
     : url.pathname;
   res.setHeader('cache-control', 'no-store');
+  // This route can read local conversations and write Sessions, so it must sit
+  // behind Connection's Host/Origin and browser-credential admission instead of
+  // trusting any local HTTP caller. A missing admission service fails closed.
+  const rejected = connectionRejection(ctx, req);
+  if (rejected) {
+    sendJson(res, rejected.status, { ok: false, error: { message: rejected.message } });
+    return;
+  }
   if (req.method === 'GET' && route === '/ping') {
     sendJson(res, 200, { ok: true, codexHome: env.codexHome, stateFile: env.stateFile });
     return;
@@ -115,6 +123,27 @@ async function handleRequest(ctx, env, req, res) {
   if (route === '/verify') return verify(ctx, body, res);
   if (route === '/imports') return listImports(env, res);
   sendJson(res, 404, { ok: false, error: { message: `未知接口 ${route}` } });
+}
+
+function connectionRejection(ctx, req) {
+  let connection = null;
+  try {
+    connection = ctx.get('connection');
+  } catch {
+    connection = null;
+  }
+  if (!connection || typeof connection.requestRejection !== 'function') {
+    return { status: 503, message: '拒绝访问：连接准入服务不可用' };
+  }
+  let rejection;
+  try {
+    rejection = connection.requestRejection({ headers: req.headers || {} });
+  } catch {
+    return { status: 503, message: '拒绝访问：连接准入检查失败' };
+  }
+  if (rejection === 401) return { status: 401, message: '拒绝访问：未经认证的请求' };
+  if (rejection === 403) return { status: 403, message: '拒绝访问：来源校验未通过' };
+  return null;
 }
 
 function readJsonBody(req) {

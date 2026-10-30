@@ -74,11 +74,16 @@ Restart or reload the page after installing; the entry appears under the sidebar
   switch is an explicit override.
 - Single-direction only: the source thread is never modified.
 
-## Privacy
+## Security & privacy
 
+- The panel talks to its Host half through a same-origin HTTP route that is gated by Connection
+  admission (`ctx.connection.requestRejection`): the request must pass the Host/Origin check and carry
+  the authenticated browser credential, exactly like the app's own `/api` traffic. The route fails
+  closed with `503` when the admission service is unavailable, and answers `401`/`403` as Connection
+  decides.
 - Reads only `~/.codex` rollout metadata/content for the thread you ask for.
 - Writes only Harness Sessions and plugin state (`~/.dsh/codex-importer/imports.json`).
-- The panel talks to its Host half over a same-origin HTTP endpoint; nothing is uploaded anywhere.
+- Nothing is uploaded anywhere.
 - The optional “hide external tool names” switch rewrites visible message text only; tool arguments
   and outputs keep the original content.
 
