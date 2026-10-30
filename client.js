@@ -4,7 +4,7 @@
  * endpoint and opens the imported Session through the Client services.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-codex-importer',
+  id: 'dsh-conversation-import',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
