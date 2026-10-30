@@ -1,0 +1,51 @@
+{
+  "name": "dsh-conversation-import",
+  "version": "0.1.0",
+  "description": "Import a local Codex conversation thread into a DeepSeek Harness Session, filed under its original working directory, with optional auto-sync.",
+  "type": "module",
+  "license": "MIT",
+  "author": "kermars39-web",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kermars39-web/dsh-conversation-import"
+  },
+  "homepage": "https://github.com/kermars39-web/dsh-conversation-import#readme",
+  "bugs": {
+    "url": "https://github.com/kermars39-web/dsh-conversation-import/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "conversation-import",
+    "session",
+    "sidebar",
+    "codex"
+  ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.5 <0.3.0-0"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  }
+}

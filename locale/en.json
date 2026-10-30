@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Conversation Import",
+    "description": "Paste a conversation deep link to import it into its own directory as a local Session, with optional auto-sync."
+  }
+}
