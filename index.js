@@ -1065,13 +1065,24 @@ function buildEvents(parsed, options) {
 
   turns.forEach((turn, turnIndex) => {
     const turnNumber = turnBase + turnIndex;
-    const turnStart = turn.startTime ?? (turn.prompts.length ? turn.prompts[0].time : null) ?? lastTime + 1;
+    let turnStart = Math.round(
+      turn.startTime ?? (turn.prompts.length ? turn.prompts[0].time : null) ?? lastTime + 1,
+    );
+    if (!Number.isFinite(turnStart) || turnStart <= lastTime) turnStart = lastTime + 1;
+    // Keep each turn's events inside its own source window so merged ambient
+    // steps cannot stretch or collapse the displayed duration.
+    const rawEnd = Math.round(turn.endTime ?? turnStart);
+    let turnEnd = Math.max(rawEnd, turnStart + 1000, lastTime + 1000);
+    const inTurn = (time) => {
+      const value = typeof time === 'number' && Number.isFinite(time) ? Math.round(time) : turnStart;
+      return Math.min(Math.max(value, turnStart), turnEnd - 1);
+    };
     push('turn/start', { turn: turnNumber }, turnStart);
 
     const steps = turn.steps.length ? turn.steps : [{ text: '', tools: [], time: turnStart, endTime: turnStart }];
     steps.forEach((step, stepIndex) => {
       const stepNumber = stepIndex + 1;
-      const stepTime = step.time ?? turnStart;
+      const stepTime = inTurn(step.time);
       push('step/start', { turn: turnNumber, step: stepNumber }, stepTime);
 
       if (stepIndex === 0) {
@@ -1091,14 +1102,14 @@ function buildEvents(parsed, options) {
               role: 'user',
               id: messageId(),
             },
-            prompt.time ?? stepTime,
+            inTurn(prompt.time),
             { surfaceOp: 'append' },
           );
           if (!titleWritten) {
             push(
               'session/title',
               { title: options.title, messageSeqs: [event.seq], source: { kind: 'fallback' } },
-              (prompt.time ?? stepTime) + 1,
+              inTurn(prompt.time),
             );
             titleWritten = true;
           }
@@ -1145,7 +1156,7 @@ function buildEvents(parsed, options) {
             name: tool.name,
             arguments: JSON.stringify(tool.args),
           },
-          tool.time ?? stepTime,
+          inTurn(tool.time),
         );
       });
       tools.forEach((tool, index) => {
@@ -1164,13 +1175,13 @@ function buildEvents(parsed, options) {
           data.message.isError = true;
           data.error = { name: 'CommandFailed', code: 'tool/nonzero-exit', reason: '命令以非零状态退出' };
         }
-        push('tool/result', data, tool.endTime ?? (tool.time ?? stepTime) + 1, { surfaceOp: 'append' });
+        push('tool/result', data, inTurn(tool.endTime ?? tool.time), { surfaceOp: 'append' });
       });
-      push('step/end', { turn: turnNumber, step: stepNumber }, step.endTime ?? stepTime);
+      push('step/end', { turn: turnNumber, step: stepNumber }, inTurn(step.endTime ?? step.time));
     });
 
     const reason = turn.status === 'completed' ? { kind: 'completed' } : { kind: 'interrupted' };
-    push('turn/end', { turn: turnNumber, reason }, turn.endTime ?? lastTime + 1);
+    push('turn/end', { turn: turnNumber, reason }, turnEnd);
   });
 
   return events;
@@ -1201,6 +1212,10 @@ async function preview(ctx, env, body, res) {
 }
 
 async function importFromRequest(ctx, env, body, res) {
+  sendJson(res, 200, await performImport(ctx, env, body));
+}
+
+async function performImport(ctx, env, body) {
   const threadId = parseThreadRef(body?.link);
   const loaded = await loadThread(env, threadId);
   const state = await readState(env);
@@ -1209,7 +1224,7 @@ async function importFromRequest(ctx, env, body, res) {
     try {
       const snapshot = await ctx.sessionPersistence.stat(previous.sessionId);
       if (snapshot) {
-        sendJson(res, 200, {
+        return {
           ok: true,
           alreadyImported: true,
           session: {
@@ -1218,8 +1233,7 @@ async function importFromRequest(ctx, env, body, res) {
             cwd: loaded.parsed.meta.cwd,
             workspace: await describeWorkspace(ctx, loaded.parsed.meta.cwd),
           },
-        });
-        return;
+        };
       }
     } catch {
       /* stale record: import again */
@@ -1314,7 +1328,7 @@ async function importFromRequest(ctx, env, body, res) {
   };
   await writeState(env, state);
 
-  sendJson(res, 200, {
+  return {
     ok: true,
     alreadyImported: false,
     session: {
@@ -1330,7 +1344,7 @@ async function importFromRequest(ctx, env, body, res) {
       sessionId,
     },
     thread: describeThread(loaded),
-  });
+  };
 }
 
 const cwdCache = new Map();
