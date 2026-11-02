@@ -707,156 +707,6 @@ async function persistPromptImages(ctx, turns) {
   return saved;
 }
 
-function promptMessageContent(prompt) {
-  const content = [];
-  if (prompt && prompt.text) content.push({ type: 'text', text: prompt.text });
-  for (const image of (prompt && prompt.images) || []) {
-    if (image && image.attachment) content.push({ type: 'image', attachment: image.attachment });
-  }
-  return content;
-}
-
-async function sessionEventsFor(ctx, live, sessionId) {
-  if (live) return live.snapshotEvents();
-  let handle;
-  try {
-    handle = await ctx.sessionPersistence.open(sessionId, 'read');
-    const read = await handle.read(0, 1000000);
-    return read.events || [];
-  } catch {
-    return null;
-  } finally {
-    if (handle) await handle.close().catch(() => {});
-  }
-}
-
-async function appendUserMessageReplacements(ctx, live, sessionId, replacements) {
-  if (!replacements.length) return 0;
-  if (live) {
-    let appended = 0;
-    for (const item of replacements) {
-      try {
-        live.append(
-          'user/message',
-          item.data,
-          {
-            surfaceOp: { op: 'replace', startSeq: item.latestSeq, endSeq: item.latestSeq },
-            sourceEventSeqs: [item.latestSeq],
-          },
-        );
-        appended += 1;
-      } catch {
-        break;
-      }
-    }
-    try {
-      await ctx.sessions.flush(live);
-    } catch {
-      /* durability is best effort */
-    }
-    return appended;
-  }
-  let writer;
-  try {
-    writer = await ctx.sessionPersistence.open(sessionId, 'write');
-  } catch {
-    return 0;
-  }
-  try {
-    let nextSeq = replacements.reduce((max, item) => Math.max(max, item.latestSeq + 1), 0);
-    let nextTime = Date.now();
-    const batch = replacements.map((item) => ({
-      type: 'user/message',
-      seq: nextSeq++,
-      time: nextTime++,
-      data: item.data,
-      surfaceOp: { op: 'replace', startSeq: item.latestSeq, endSeq: item.latestSeq },
-      sourceEventSeqs: [item.latestSeq],
-    }));
-    await writer.append(batch);
-    await writer.flush();
-    return batch.length;
-  } finally {
-    await writer.close().catch(() => {});
-  }
-}
-
-/**
- * Repair already-imported history in place: strip the Codex attachment preamble
- * and attach the images the user sent, via supported surface replacements.
- */
-async function repairImportedContent(ctx, sessions, live, record, completed) {
-  if (!record || (record.promptsSanitized === true && record.imagesRepaired === true)) return 0;
-  if (!Array.isArray(completed) || !completed.length) return 0;
-  const contributed = Number.isInteger(record.turns)
-    ? completed.slice(0, Math.min(record.turns, completed.length))
-    : completed;
-  if (!contributed.length) return 0;
-  await persistPromptImages(ctx, contributed);
-  const events = await sessionEventsFor(ctx, live, record.sessionId);
-  if (!events) return 0;
-
-  const latestByOrigin = new Map();
-  const eventBySeq = new Map();
-  for (const event of events) {
-    if (event && typeof event.seq === 'number') eventBySeq.set(event.seq, event);
-  }
-  for (const event of events) {
-    if (!event || event.type !== 'user/message') continue;
-    const op = event.surfaceOp;
-    if (op && typeof op === 'object' && op.op === 'replace') {
-      latestByOrigin.set(op.startSeq, event.seq);
-    } else {
-      latestByOrigin.set(event.seq, event.seq);
-    }
-  }
-
-  const turnMessages = new Map();
-  let currentTurn = 0;
-  for (const event of events) {
-    if (!event) continue;
-    if (event.type === 'turn/start' && typeof event.data?.turn === 'number') currentTurn = event.data.turn;
-    else if (event.type === 'user/message') {
-      const op = event.surfaceOp;
-      const origin = op && typeof op === 'object' && op.op === 'replace' ? op.startSeq : event.seq;
-      if (!turnMessages.has(currentTurn)) turnMessages.set(currentTurn, []);
-      if (!turnMessages.get(currentTurn).includes(origin)) turnMessages.get(currentTurn).push(origin);
-    }
-  }
-
-  const replacements = [];
-  contributed.forEach((sourceTurn, index) => {
-    const seqs = turnMessages.get(index + 1) || [];
-    (sourceTurn.prompts || []).forEach((prompt, promptIndex) => {
-      const origin = seqs[promptIndex];
-      if (origin === undefined) return;
-      const latestSeq = latestByOrigin.get(origin) ?? origin;
-      const current = eventBySeq.get(latestSeq);
-      if (!current) return;
-      const currentData = current.data || {};
-      const currentBlocks = Array.isArray(currentData.content) ? currentData.content : [];
-      const currentText = sanitizePromptText(promptTextOf(currentData));
-      const desiredText = prompt.text || '';
-      const desiredImages = (prompt.images || []).filter((image) => image && image.attachment);
-      const currentImageCount = currentBlocks.filter((block) => block && block.type === 'image').length;
-      if (desiredText === currentText && currentImageCount >= desiredImages.length) return;
-      const content = [];
-      if (desiredText) content.push({ type: 'text', text: desiredText });
-      for (const image of desiredImages) content.push({ type: 'image', attachment: image.attachment });
-      if (!content.length) return;
-      replacements.push({ latestSeq, data: { ...currentData, content } });
-    });
-  });
-
-  const appended = await appendUserMessageReplacements(ctx, live, record.sessionId, replacements);
-  if (appended || !replacements.length) {
-    record.promptsSanitized = true;
-    record.imagesRepaired = true;
-    record.events = (record.events || 0) + appended;
-  }
-  return appended;
-}
-
 function normalizeTurn(turn, index) {
   const items = [...turn.items].sort((left, right) => left.ordinal - right.ordinal);
   const combined = [
@@ -1386,6 +1236,7 @@ async function importFromRequest(ctx, env, body, res) {
   const completed = loaded.parsed.turns.filter((turn) => turn.status === 'completed');
   const sourceTurns = completed.length ? completed : loaded.parsed.turns;
   const turns = maxTurns > 0 ? sourceTurns.slice(-maxTurns) : sourceTurns;
+  await persistPromptImages(ctx, turns);
   const events = buildEvents(loaded.parsed, {
     title,
     includeToolCalls,
@@ -1400,7 +1251,6 @@ async function importFromRequest(ctx, env, body, res) {
   });
   if (!events.length) throw bad('这段对话还没有可导入的内容');
 
-  await persistPromptImages(ctx, turns);
   const sessionId = `session-${crypto.randomUUID()}`;
   const createdAt = events[0].time;
   const header = {
@@ -1461,8 +1311,6 @@ async function importFromRequest(ctx, env, body, res) {
     sync: true,
     lastSyncAt: Date.now(),
     lastSyncResult: null,
-    promptsSanitized: true,
-    imagesRepaired: true,
   };
   await writeState(env, state);
 
@@ -1631,9 +1479,7 @@ async function syncOne(ctx, env, state, threadId, record, force) {
     result.skipped = 'source-missing';
     return result;
   }
-  const needsRepair =
-    record.promptsSanitized !== true || record.imagesRepaired !== true;
-  if (!force && !needsRepair && record.sourceMtime && stat.mtimeMs === record.sourceMtime) {
+  if (!force && record.sourceMtime && stat.mtimeMs === record.sourceMtime) {
     result.skipped = 'unchanged';
     return result;
   }
@@ -1708,15 +1554,11 @@ async function syncOne(ctx, env, state, threadId, record, force) {
   const text = await readRolloutText(record.rolloutFile);
   const parsed = parseRollout(text);
   const completed = parsed.turns.filter((turn) => turn.status === 'completed');
-  const repaired = needsRepair
-    ? await repairImportedContent(ctx, sessions, live, record, completed).catch(() => 0)
-    : 0;
-  if (repaired) result.repaired = repaired;
   const synced = Number.isInteger(record.syncedTurns) ? record.syncedTurns : 0;
   if (completed.length <= synced) {
     record.sourceMtime = stat.mtimeMs;
     record.lastSyncAt = Date.now();
-    record.lastSyncResult = repaired ? `已补充历史图片 ${repaired} 处` : '已是最新';
+    record.lastSyncResult = '已是最新';
     if (completed.length < synced) record.syncedTurns = completed.length;
     result.skipped = 'no-new-turns';
     return result;

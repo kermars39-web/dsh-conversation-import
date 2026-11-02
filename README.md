@@ -95,8 +95,8 @@ Restart or reload the page after installing; the entry appears under the sidebar
 - Images the user attached are imported as native image blocks: bytes are committed to the Harness
   attachment store (normalized, content-addressed, so repeats cost one object) and the generated attachment
   preamble (file lists, temp paths, `<image>` tags) is stripped from the text. Tool-output screenshots are
-  not imported, which keeps a 90-screenshot thread from adding tens of megabytes. Earlier imported messages
-  are repaired in place with a surface replacement.
+  not imported, which keeps a 90-screenshot thread from adding tens of megabytes. Conversations imported
+  before this feature should be re-imported (再导入一份) to get their attachments.
 - Threads split across several rollout files use the newest segment; multi-segment merging is planned.
 - An already-open Session does not stream appended turns; reopen it or refresh the list to see them.
 - Windows is untested.
