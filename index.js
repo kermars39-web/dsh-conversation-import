@@ -1283,10 +1283,51 @@ async function syncOne(ctx, env, state, threadId, record, force) {
     }
     record.rolloutFile = located.file;
   }
+  let stat;
+  try {
+    stat = await fsp.stat(record.rolloutFile);
+  } catch {
+    result.skipped = 'source-missing';
+    return result;
+  }
+  if (!force && record.sourceMtime && stat.mtimeMs === record.sourceMtime) {
+    result.skipped = 'unchanged';
+    return result;
+  }
+
+  // Prefer the live Session: an open conversation owns the log writer, so the
+  // closed-log path could never append while the user is reading it. Appending
+  // through the live Session also makes the new turns appear immediately.
+  const sessions = safeService(ctx, 'sessions');
+  const live = sessions && typeof sessions.get === 'function' ? sessions.get(record.sessionId) : undefined;
+  let liveState = null;
+  if (live) {
+    liveState = liveTurnState(live);
+    if (liveState.open) {
+      result.skipped = 'session-busy';
+      record.lastSyncAt = Date.now();
+      record.lastSyncResult = '等待：会话正在生成，稍后自动同步';
+      return result;
+    }
+  } else {
+    // Cheap ownership probe first: a busy closed-log Session must not cost a
+    // full rollout parse on every tick.
+    let probe;
+    try {
+      probe = await ctx.sessionPersistence.open(record.sessionId, 'write');
+    } catch {
+      result.skipped = 'session-busy';
+      record.lastSyncAt = Date.now();
+      record.lastSyncResult = '等待：会话正在使用，稍后自动同步';
+      return result;
+    }
+    await probe.close().catch(() => {});
+  }
+
   if (!Number.isInteger(record.syncedTurns)) {
-    // Sessions imported before auto sync existed carry no watermark; adopt the
-    // turns already closed in their log so the first check never duplicates.
-    const legacyTail = await readSessionTail(ctx, record.sessionId);
+    const legacyTail = liveState
+      ? { closedTurns: liveState.closedTurn }
+      : await readSessionTail(ctx, record.sessionId);
     record.syncedTurns = legacyTail.closedTurns ?? 0;
     record.sync = record.sync !== false;
     record.includeToolCalls = record.includeToolCalls !== false;
@@ -1299,26 +1340,20 @@ async function syncOne(ctx, env, state, threadId, record, force) {
     result.skipped = 'initialized';
     return result;
   }
-  let stat;
-  try {
-    stat = await fsp.stat(record.rolloutFile);
-  } catch {
-    result.skipped = 'source-missing';
+
+  // The stored turn count tracks how many turns this plugin contributed.
+  const storedTail = liveState
+    ? { lastTurn: liveState.closedTurn, closedTurns: liveState.closedTurn, lastTime: liveState.lastTime, nextSeq: live.seq }
+    : await readSessionTail(ctx, record.sessionId);
+  if (storedTail.error) {
+    result.error = storedTail.error;
     return result;
   }
-  if (!force && record.sourceMtime && stat.mtimeMs === record.sourceMtime) {
-    result.skipped = 'unchanged';
-    return result;
-  }
-  const tail = await readSessionTail(ctx, record.sessionId);
-  if (tail.error) {
-    result.error = tail.error;
-    return result;
-  }
+
   // A conversation continued here diverges from its source; appending source
   // turns afterwards would interleave two story lines, so pause instead.
-  const expectedTurns = Number.isInteger(record.turns) ? record.turns : tail.lastTurn;
-  if (!force && record.approvedDiverged !== true && tail.lastTurn > expectedTurns) {
+  const expectedTurns = Number.isInteger(record.turns) ? record.turns : storedTail.lastTurn;
+  if (!force && record.approvedDiverged !== true && storedTail.lastTurn > expectedTurns) {
     record.sync = false;
     record.diverged = true;
     record.lastSyncAt = Date.now();
@@ -1326,6 +1361,7 @@ async function syncOne(ctx, env, state, threadId, record, force) {
     result.skipped = 'diverged';
     return result;
   }
+
   const text = await readRolloutText(record.rolloutFile);
   const parsed = parseRollout(text);
   const completed = parsed.turns.filter((turn) => turn.status === 'completed');
@@ -1339,17 +1375,66 @@ async function syncOne(ctx, env, state, threadId, record, force) {
     return result;
   }
   const newTurns = completed.slice(synced);
-  const events = buildEvents(parsed, {
+  const buildOptions = {
     title: record.title,
     includeToolCalls: record.includeToolCalls !== false,
     rebrandText: record.rebrandText !== false,
-    turns: newTurns,
-    append: true,
-    turnStart: tail.lastTurn + 1,
-    seqStart: tail.nextSeq,
-    timeFloor: tail.lastTime,
     provider: PROVIDER,
     model: MODEL,
+  };
+
+  if (live) {
+    let closedTurn = liveState.closedTurn;
+    let appended = 0;
+    let appendedEvents = 0;
+    for (const turn of newTurns) {
+      closedTurn += 1;
+      const built = buildEvents(parsed, {
+        ...buildOptions,
+        turns: [turn],
+        append: true,
+        turnStart: closedTurn,
+        seqStart: 0,
+        timeFloor: liveState.lastTime,
+      });
+      try {
+        for (const event of built) {
+          if (event.surfaceOp) live.append(event.type, event.data, { surfaceOp: event.surfaceOp });
+          else live.append(event.type, event.data);
+        }
+      } catch (error) {
+        result.error = `追加到打开中的会话失败：${error?.message || error}`;
+        break;
+      }
+      appended += 1;
+      appendedEvents += built.length;
+      record.syncedTurns = synced + appended;
+      record.turns = (record.turns || 0) + 1;
+      record.events = (record.events || 0) + built.length;
+    }
+    if (appended) {
+      try {
+        await ctx.sessions.flush(live);
+      } catch {
+        /* durability is best effort */
+      }
+      record.sourceMtime = stat.mtimeMs;
+      record.lastSyncAt = Date.now();
+      record.lastSyncResult = `已在打开中的会话内追加 ${appended} 轮`;
+      result.live = true;
+      result.turns = appended;
+      result.events = appendedEvents;
+    }
+    return result;
+  }
+
+  const events = buildEvents(parsed, {
+    ...buildOptions,
+    turns: newTurns,
+    append: true,
+    turnStart: storedTail.lastTurn + 1,
+    seqStart: storedTail.nextSeq,
+    timeFloor: storedTail.lastTime,
   });
   if (!events.length) {
     record.sourceMtime = stat.mtimeMs;
@@ -1359,10 +1444,10 @@ async function syncOne(ctx, env, state, threadId, record, force) {
   let writer;
   try {
     writer = await ctx.sessionPersistence.open(record.sessionId, 'write');
-  } catch (error) {
+  } catch {
     result.skipped = 'session-busy';
     record.lastSyncAt = Date.now();
-    record.lastSyncResult = `等待：会话正在使用（${error?.message || error}）`;
+    record.lastSyncResult = '等待：会话正在使用，稍后自动同步';
     return result;
   }
   try {
@@ -1394,6 +1479,30 @@ async function syncOne(ctx, env, state, threadId, record, force) {
   result.turns = newTurns.length;
   result.events = events.length;
   return result;
+}
+
+function safeService(ctx, name) {
+  try {
+    return ctx.get(name);
+  } catch {
+    return undefined;
+  }
+}
+
+function liveTurnState(session) {
+  const events = session.snapshotEvents();
+  let closedTurn = 0;
+  let open = false;
+  let lastTime = 0;
+  for (const event of events) {
+    if (event.type === 'turn/start') open = true;
+    else if (event.type === 'turn/end') {
+      open = false;
+      if (typeof event.data?.turn === 'number' && event.data.turn > closedTurn) closedTurn = event.data.turn;
+    }
+    if (typeof event.time === 'number' && event.time > lastTime) lastTime = event.time;
+  }
+  return { open, closedTurn, lastTime, seq: session.seq };
 }
 
 async function readSessionTail(ctx, sessionId) {

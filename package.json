@@ -1,6 +1,6 @@
 {
   "name": "dsh-conversation-import",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Import a local Codex conversation thread into a DeepSeek Harness Session, filed under its original working directory, with optional auto-sync.",
   "type": "module",
   "license": "MIT",

@@ -68,7 +68,9 @@ Restart or reload the page after installing; the entry appears under the sidebar
 - Polls every 60 seconds; a source file whose mtime did not change is not parsed again.
 - Only **completed** turns are appended, using a `syncedTurns` watermark; event sequence and time
   continue from the existing log.
-- Skipped while the Session is in use (another writer owns it); retried on the next tick.
+- If the Session is **open**, the new turns are appended through the live Session, so they appear in the
+  open conversation immediately; while the conversation is generating, the check waits for the next tick.
+  A closed Session is appended through its log writer (with a cheap ownership probe first).
 - **Divergence guard**: if the Session already contains turns beyond the last sync (you continued it
   locally), auto-sync pauses for that conversation and the UI says so. Re-enabling the per-conversation
   switch is an explicit override.
