@@ -10,7 +10,7 @@ timestamps reconstructed — and keep it updated with an optional auto-sync.
 
 - Resolves a conversation deep link (`codex://threads/<id>` or a bare thread id) against the local
   Codex rollout store and rebuilds it as a Harness Session.
-- Rebuilds turns, steps, tool calls and results as native Harness session events: `bash`, `write`,
+- Rebuilds turns, steps, user attachments, tool calls and results as native Harness session events: `bash`, `write`,
   `edit`, `web_search`, `web_fetch`, with real timestamps and the original title.
 - Files the Session under the original `cwd` (existing Harness workspace, or creates one), so it
   shows up in the sidebar where that project lives.
@@ -92,8 +92,10 @@ Restart or reload the page after installing; the entry appears under the sidebar
 ## Known limitations
 
 - Import is a snapshot; the last (still generating) turn is imported by a later sync.
-- Images and file attachments in the source thread are not imported; the generated attachment preamble
-  (file lists, `<image>` tags, temp paths) is stripped from user messages, and earlier imported sessions
+- Images the user attached are imported as native image blocks: bytes are committed to the Harness
+  attachment store (normalized, content-addressed, so repeats cost one object) and the generated attachment
+  preamble (file lists, temp paths, `<image>` tags) is stripped from the text. Tool-output screenshots are
+  not imported, which keeps a 90-screenshot thread from adding tens of megabytes. Earlier imported messages
   are repaired in place with a surface replacement.
 - Threads split across several rollout files use the newest segment; multi-segment merging is planned.
 - An already-open Session does not stream appended turns; reopen it or refresh the list to see them.

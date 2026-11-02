@@ -583,103 +583,278 @@ function promptTextOf(message) {
  * surface replacements for those user messages so the visible history (and the
  * model-visible projection) carries just the request text.
  */
-async function repairImportedPrompts(ctx, sessions, record) {
-  if (!record || record.promptsSanitized === true) return 0;
+function sniffImageMediaType(bytes) {
+  if (!bytes || bytes.length < 12) return null;
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  const head = Buffer.from(bytes.slice(0, 12));
+  if (head.toString('utf8', 0, 3) === 'GIF') return 'image/gif';
+  if (head.toString('utf8', 0, 4) === 'RIFF' && head.toString('utf8', 8, 12) === 'WEBP') return 'image/webp';
+  return null;
+}
+
+function decodeDataUrl(url) {
+  const comma = url.indexOf(',');
+  if (comma < 0) return null;
+  const meta = url.slice(5, comma);
+  const parts = meta.split(';');
+  if (!parts.includes('base64')) return null;
+  const base64 = url.slice(comma + 1);
   try {
-    return await repairImportedPromptsInner(ctx, sessions, record);
+    return { mediaType: parts[0] || undefined, bytes: Buffer.from(base64, 'base64') };
   } catch {
-    return 0;
+    return null;
   }
 }
 
-async function repairImportedPromptsInner(ctx, sessions, record) {
-  const live = sessions && typeof sessions.get === 'function' ? sessions.get(record.sessionId) : undefined;
-  let events = [];
-  let liveSession = live;
-  if (liveSession) {
-    events = liveSession.snapshotEvents();
-  } else {
-    let handle;
-    try {
-      handle = await ctx.sessionPersistence.open(record.sessionId, 'read');
-      const read = await handle.read(0, 1000000);
-      events = read.events || [];
-    } catch {
-      return 0;
-    } finally {
-      if (handle) await handle.close().catch(() => {});
+function imageFromBlock(block) {
+  if (!block || typeof block !== 'object') return null;
+  const url = block.image_url || block.url;
+  if ((block.type === 'input_image' || block.type === 'image_url' || block.type === 'image') && typeof url === 'string') {
+    if (!url.startsWith('data:')) return null;
+    const decoded = decodeDataUrl(url);
+    if (!decoded) return null;
+    return { kind: 'data', mediaType: decoded.mediaType, bytes: decoded.bytes };
+  }
+  if (block.type === 'local_image' && typeof block.path === 'string' && block.path) {
+    return { kind: 'path', path: block.path };
+  }
+  return null;
+}
+
+function contentImages(content) {
+  if (!Array.isArray(content)) return [];
+  const images = [];
+  for (const block of content) {
+    const image = imageFromBlock(block);
+    if (image) images.push(image);
+  }
+  return images;
+}
+
+function imageSignature(image) {
+  if (!image) return '';
+  if (image.kind === 'data') {
+    const bytes = image.bytes;
+    if (!bytes || !bytes.length) return '';
+    const sample = bytes.length
+      ? `${bytes.length}:${bytes.toString('base64').slice(0, 48)}:${bytes.toString('base64').slice(-24)}`
+      : '';
+    return `data:${image.mediaType || ''}:${sample}`;
+  }
+  if (image.kind === 'path') return `path:${image.path}`;
+  return '';
+}
+
+function addPromptImage(prompt, image) {
+  const signature = imageSignature(image);
+  if (!signature || prompt.imageKeys.has(signature)) return;
+  if (image.kind === 'path' && prompt.images.some((item) => item.kind === 'data')) return;
+  if (image.kind === 'data') {
+    prompt.images = prompt.images.filter((item) => item.kind === 'data');
+    prompt.imageKeys = new Set(prompt.images.map(imageSignature));
+  }
+  prompt.imageKeys.add(signature);
+  prompt.images.push(image);
+}
+
+/**
+ * Persist prompt images into the Harness attachment store and rewrite each
+ * prompt's descriptors into `image` content blocks. Only images the user
+ * attached are imported; tool-output screenshots stay text-only to keep the
+ * imported session close to the conversation size.
+ */
+async function persistPromptImages(ctx, turns) {
+  let attachments = null;
+  try {
+    attachments = ctx.get('attachments');
+  } catch {
+    attachments = null;
+  }
+  if (!attachments || typeof attachments.saveImage !== 'function') return 0;
+  let saved = 0;
+  for (const turn of turns || []) {
+    for (const prompt of turn.prompts || []) {
+      const images = prompt.images || [];
+      if (!images.length) continue;
+      const blocks = [];
+      for (const image of images) {
+        try {
+          let bytes = image.bytes;
+          let mediaType = image.mediaType;
+          let name;
+          if (image.kind === 'path') {
+            bytes = await fsp.readFile(image.path);
+            name = path.basename(image.path);
+          }
+          if (!bytes || !bytes.length) continue;
+          mediaType = mediaType || sniffImageMediaType(bytes);
+          if (!mediaType) continue;
+          const ref = await attachments.saveImage({
+            data: new Uint8Array(bytes),
+            mediaType,
+            name,
+          });
+          blocks.push({ type: 'image', attachment: ref });
+          saved += 1;
+        } catch {
+          /* skip images the store refuses; keep the text prompt */
+        }
+      }
+      prompt.images = blocks;
     }
   }
-  const shadowed = new Set();
-  for (const event of events) {
-    const op = event.surfaceOp;
-    if (op && typeof op === 'object' && op.op === 'replace') {
-      for (let seq = op.startSeq; seq <= op.endSeq; seq += 1) shadowed.add(seq);
-    }
+  return saved;
+}
+
+function promptMessageContent(prompt) {
+  const content = [];
+  if (prompt && prompt.text) content.push({ type: 'text', text: prompt.text });
+  for (const image of (prompt && prompt.images) || []) {
+    if (image && image.attachment) content.push({ type: 'image', attachment: image.attachment });
   }
-  const targets = events.filter(
-    (event) =>
-      event.type === 'user/message' &&
-      !shadowed.has(event.seq) &&
-      sanitizePromptText(promptTextOf(event.data)) !== promptTextOf(event.data),
-  );
-  if (!targets.length) {
-    record.promptsSanitized = true;
-    return 0;
+  return content;
+}
+
+async function sessionEventsFor(ctx, live, sessionId) {
+  if (live) return live.snapshotEvents();
+  let handle;
+  try {
+    handle = await ctx.sessionPersistence.open(sessionId, 'read');
+    const read = await handle.read(0, 1000000);
+    return read.events || [];
+  } catch {
+    return null;
+  } finally {
+    if (handle) await handle.close().catch(() => {});
   }
-  let repaired = 0;
-  if (liveSession) {
-    for (const target of targets) {
-      const data = {
-        ...target.data,
-        content: [{ type: 'text', text: sanitizePromptText(promptTextOf(target.data)) }],
-      };
+}
+
+async function appendUserMessageReplacements(ctx, live, sessionId, replacements) {
+  if (!replacements.length) return 0;
+  if (live) {
+    let appended = 0;
+    for (const item of replacements) {
       try {
-        liveSession.append('user/message', data, {
-          surfaceOp: { op: 'replace', startSeq: target.seq, endSeq: target.seq },
-          sourceEventSeqs: [target.seq],
-        });
-        repaired += 1;
+        live.append(
+          'user/message',
+          item.data,
+          {
+            surfaceOp: { op: 'replace', startSeq: item.latestSeq, endSeq: item.latestSeq },
+            sourceEventSeqs: [item.latestSeq],
+          },
+        );
+        appended += 1;
       } catch {
-        return 0;
+        break;
       }
     }
     try {
-      await ctx.sessions.flush(liveSession);
+      await ctx.sessions.flush(live);
     } catch {
       /* durability is best effort */
     }
-  } else {
-    let writer;
-    try {
-      writer = await ctx.sessionPersistence.open(record.sessionId, 'write');
-    } catch {
-      return 0;
-    }
-    try {
-      let nextSeq = events.reduce((max, event) => Math.max(max, event.seq ?? 0), 0) + 1;
-      let nextTime = events.reduce((max, event) => Math.max(max, event.time ?? 0), 0) + 1;
-      const appended = targets.map((target) => ({
-        type: 'user/message',
-        seq: nextSeq++,
-        time: nextTime++,
-        data: {
-          ...target.data,
-          content: [{ type: 'text', text: sanitizePromptText(promptTextOf(target.data)) }],
-        },
-        surfaceOp: { op: 'replace', startSeq: target.seq, endSeq: target.seq },
-        sourceEventSeqs: [target.seq],
-      }));
-      await writer.append(appended);
-      await writer.flush();
-      repaired = appended.length;
-    } finally {
-      await writer.close().catch(() => {});
+    return appended;
+  }
+  let writer;
+  try {
+    writer = await ctx.sessionPersistence.open(sessionId, 'write');
+  } catch {
+    return 0;
+  }
+  try {
+    let nextSeq = replacements.reduce((max, item) => Math.max(max, item.latestSeq + 1), 0);
+    let nextTime = Date.now();
+    const batch = replacements.map((item) => ({
+      type: 'user/message',
+      seq: nextSeq++,
+      time: nextTime++,
+      data: item.data,
+      surfaceOp: { op: 'replace', startSeq: item.latestSeq, endSeq: item.latestSeq },
+      sourceEventSeqs: [item.latestSeq],
+    }));
+    await writer.append(batch);
+    await writer.flush();
+    return batch.length;
+  } finally {
+    await writer.close().catch(() => {});
+  }
+}
+
+/**
+ * Repair already-imported history in place: strip the Codex attachment preamble
+ * and attach the images the user sent, via supported surface replacements.
+ */
+async function repairImportedContent(ctx, sessions, live, record, completed) {
+  if (!record || (record.promptsSanitized === true && record.imagesRepaired === true)) return 0;
+  if (!Array.isArray(completed) || !completed.length) return 0;
+  const contributed = Number.isInteger(record.turns)
+    ? completed.slice(0, Math.min(record.turns, completed.length))
+    : completed;
+  if (!contributed.length) return 0;
+  await persistPromptImages(ctx, contributed);
+  const events = await sessionEventsFor(ctx, live, record.sessionId);
+  if (!events) return 0;
+
+  const latestByOrigin = new Map();
+  const eventBySeq = new Map();
+  for (const event of events) {
+    if (event && typeof event.seq === 'number') eventBySeq.set(event.seq, event);
+  }
+  for (const event of events) {
+    if (!event || event.type !== 'user/message') continue;
+    const op = event.surfaceOp;
+    if (op && typeof op === 'object' && op.op === 'replace') {
+      latestByOrigin.set(op.startSeq, event.seq);
+    } else {
+      latestByOrigin.set(event.seq, event.seq);
     }
   }
-  record.promptsSanitized = true;
-  record.events = (record.events || 0) + repaired;
-  return repaired;
+
+  const turnMessages = new Map();
+  let currentTurn = 0;
+  for (const event of events) {
+    if (!event) continue;
+    if (event.type === 'turn/start' && typeof event.data?.turn === 'number') currentTurn = event.data.turn;
+    else if (event.type === 'user/message') {
+      const op = event.surfaceOp;
+      const origin = op && typeof op === 'object' && op.op === 'replace' ? op.startSeq : event.seq;
+      if (!turnMessages.has(currentTurn)) turnMessages.set(currentTurn, []);
+      if (!turnMessages.get(currentTurn).includes(origin)) turnMessages.get(currentTurn).push(origin);
+    }
+  }
+
+  const replacements = [];
+  contributed.forEach((sourceTurn, index) => {
+    const seqs = turnMessages.get(index + 1) || [];
+    (sourceTurn.prompts || []).forEach((prompt, promptIndex) => {
+      const origin = seqs[promptIndex];
+      if (origin === undefined) return;
+      const latestSeq = latestByOrigin.get(origin) ?? origin;
+      const current = eventBySeq.get(latestSeq);
+      if (!current) return;
+      const currentData = current.data || {};
+      const currentBlocks = Array.isArray(currentData.content) ? currentData.content : [];
+      const currentText = sanitizePromptText(promptTextOf(currentData));
+      const desiredText = prompt.text || '';
+      const desiredImages = (prompt.images || []).filter((image) => image && image.attachment);
+      const currentImageCount = currentBlocks.filter((block) => block && block.type === 'image').length;
+      if (desiredText === currentText && currentImageCount >= desiredImages.length) return;
+      const content = [];
+      if (desiredText) content.push({ type: 'text', text: desiredText });
+      for (const image of desiredImages) content.push({ type: 'image', attachment: image.attachment });
+      if (!content.length) return;
+      replacements.push({ latestSeq, data: { ...currentData, content } });
+    });
+  });
+
+  const appended = await appendUserMessageReplacements(ctx, live, record.sessionId, replacements);
+  if (appended || !replacements.length) {
+    record.promptsSanitized = true;
+    record.imagesRepaired = true;
+    record.events = (record.events || 0) + appended;
+  }
+  return appended;
 }
 
 function normalizeTurn(turn, index) {
@@ -690,22 +865,38 @@ function normalizeTurn(turn, index) {
   ].sort((left, right) => left.ordinal - right.ordinal);
 
   const prompts = [];
-  const seenPrompts = new Set();
+  const promptIndexByKey = new Map();
   for (const entry of combined) {
-    const text =
-      entry.kind === 'item' && entry.item.type === 'UserMessage'
-        ? contentText(entry.item.content)
-        : entry.kind === 'response' && entry.payload.type === 'message' && entry.payload.role === 'user'
-          ? contentText(entry.payload.content)
-          : null;
-    if (!text) continue;
-    const normalized = sanitizePromptText(normalizePrompt(text));
-    if (!normalized) continue;
-    const key = normalized.replace(/\s+/g, ' ').slice(0, 240);
-    if (seenPrompts.has(key)) continue;
-    seenPrompts.add(key);
-    prompts.push({ text: normalized, time: entry.startTime ?? entry.lineTime ?? null });
+    const isItemUser = entry.kind === 'item' && entry.item.type === 'UserMessage';
+    const isResponseUser =
+      entry.kind === 'response' && entry.payload.type === 'message' && entry.payload.role === 'user';
+    if (!isItemUser && !isResponseUser) continue;
+    const content = isItemUser ? entry.item.content : entry.payload.content;
+    const rawText = contentText(content);
+    const normalized = rawText ? sanitizePromptText(normalizePrompt(rawText)) : '';
+    const images = contentImages(content);
+    if (!normalized && !images.length) continue;
+    const key = normalized
+      ? normalized.replace(/\s+/g, ' ').slice(0, 240)
+      : `image:${images.map(imageSignature).sort().join('|')}`;
+    let prompt = prompts[promptIndexByKey.get(key)];
+    if (!prompt) {
+      prompt = {
+        text: normalized,
+        images: [],
+        imageKeys: new Set(),
+        time: entry.startTime ?? entry.lineTime ?? null,
+      };
+      promptIndexByKey.set(key, prompts.length);
+      prompts.push(prompt);
+    }
+    for (const image of images) addPromptImage(prompt, image);
+    if (!prompt.text && !prompt.images.length) {
+      prompts.pop();
+      promptIndexByKey.delete(key);
+    }
   }
+  for (const prompt of prompts) delete prompt.imageKeys;
   prompts.sort((left, right) => (left.time ?? 0) - (right.time ?? 0));
 
   const steps = [];
@@ -1036,10 +1227,16 @@ function buildEvents(parsed, options) {
       if (stepIndex === 0) {
         for (const prompt of turn.prompts) {
           if (options.rebrandText) prompt.text = rebrandText(prompt.text);
+          const content = [];
+          if (prompt.text) content.push({ type: 'text', text: prompt.text });
+          for (const image of prompt.images || []) {
+            if (image && image.attachment) content.push({ type: 'image', attachment: image.attachment });
+          }
+          if (!content.length) continue;
           const event = push(
             'user/message',
             {
-              content: [{ type: 'text', text: prompt.text }],
+              content,
               source: { kind: 'user' },
               role: 'user',
               id: messageId(),
@@ -1203,6 +1400,7 @@ async function importFromRequest(ctx, env, body, res) {
   });
   if (!events.length) throw bad('这段对话还没有可导入的内容');
 
+  await persistPromptImages(ctx, turns);
   const sessionId = `session-${crypto.randomUUID()}`;
   const createdAt = events[0].time;
   const header = {
@@ -1264,6 +1462,7 @@ async function importFromRequest(ctx, env, body, res) {
     lastSyncAt: Date.now(),
     lastSyncResult: null,
     promptsSanitized: true,
+    imagesRepaired: true,
   };
   await writeState(env, state);
 
@@ -1398,11 +1597,9 @@ async function syncRequest(ctx, env, body, res) {
 
 async function runSync(ctx, env, state, entries, force) {
   const results = [];
-  const sessions = safeService(ctx, 'sessions');
   for (const [threadId, record] of entries) {
     try {
-      const repaired = await repairImportedPrompts(ctx, sessions, record).catch(() => 0);
-      results.push(await syncOne(ctx, env, state, threadId, record, force, repaired));
+      results.push(await syncOne(ctx, env, state, threadId, record, force));
     } catch (error) {
       record.lastSyncAt = Date.now();
       record.lastSyncResult = `失败：${error?.message || error}`;
@@ -1413,8 +1610,8 @@ async function runSync(ctx, env, state, entries, force) {
   return results;
 }
 
-async function syncOne(ctx, env, state, threadId, record, force, repairedPrompts) {
-  const result = { threadId, sessionId: record.sessionId, repairedPrompts: repairedPrompts || 0 };
+async function syncOne(ctx, env, state, threadId, record, force) {
+  const result = { threadId, sessionId: record.sessionId };
   if (!force && record.sync === false) {
     result.skipped = 'disabled';
     return result;
@@ -1434,7 +1631,9 @@ async function syncOne(ctx, env, state, threadId, record, force, repairedPrompts
     result.skipped = 'source-missing';
     return result;
   }
-  if (!force && record.sourceMtime && stat.mtimeMs === record.sourceMtime) {
+  const needsRepair =
+    record.promptsSanitized !== true || record.imagesRepaired !== true;
+  if (!force && !needsRepair && record.sourceMtime && stat.mtimeMs === record.sourceMtime) {
     result.skipped = 'unchanged';
     return result;
   }
@@ -1509,16 +1708,21 @@ async function syncOne(ctx, env, state, threadId, record, force, repairedPrompts
   const text = await readRolloutText(record.rolloutFile);
   const parsed = parseRollout(text);
   const completed = parsed.turns.filter((turn) => turn.status === 'completed');
+  const repaired = needsRepair
+    ? await repairImportedContent(ctx, sessions, live, record, completed).catch(() => 0)
+    : 0;
+  if (repaired) result.repaired = repaired;
   const synced = Number.isInteger(record.syncedTurns) ? record.syncedTurns : 0;
   if (completed.length <= synced) {
     record.sourceMtime = stat.mtimeMs;
     record.lastSyncAt = Date.now();
-    record.lastSyncResult = '已是最新';
+    record.lastSyncResult = repaired ? `已补充历史图片 ${repaired} 处` : '已是最新';
     if (completed.length < synced) record.syncedTurns = completed.length;
     result.skipped = 'no-new-turns';
     return result;
   }
   const newTurns = completed.slice(synced);
+  await persistPromptImages(ctx, newTurns);
   const buildOptions = {
     title: record.title,
     includeToolCalls: record.includeToolCalls !== false,
