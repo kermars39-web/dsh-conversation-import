@@ -19,8 +19,8 @@ const ROUTE_PREFIX = '/codex-importer';
 const PROVIDER = 'deepseek-account';
 const MODEL = 'deepseek-flash';
 const MAX_COMMAND_CHARS = 20000;
-const MAX_OUTPUT_CHARS = 24000;
-const MAX_FILE_CHARS = 12000;
+const MAX_OUTPUT_CHARS = 120000;
+const MAX_FILE_CHARS = 120000;
 const APPEND_CHUNK = 80;
 const SESSION_FORMAT_VERSION = 4;
 const AUTO_SYNC_MS = 60000;
@@ -392,6 +392,7 @@ function toMillis(value) {
 function parseRollout(text) {
   const meta = { threadId: null, cwd: null, roots: [], createdAt: null, model: null, cliVersion: null };
   const turns = new Map();
+  const tokenCounts = [];
   const order = [];
   let ordinal = 0;
 
@@ -416,6 +417,12 @@ function parseRollout(text) {
       continue;
     }
     const lineTime = record.timestamp ? Date.parse(record.timestamp) : null;
+
+    if (record.type === 'event_msg' && record.payload && record.payload.type === 'token_count') {
+      const usage = record.payload.info && record.payload.info.last_token_usage;
+      if (usage) tokenCounts.push({ time: lineTime, usage });
+      continue;
+    }
 
     if (record.type === 'session_meta') {
       const payload = record.payload || {};
@@ -513,6 +520,27 @@ function parseRollout(text) {
   parsedTurns.forEach((turn, index) => {
     turn.index = index;
   });
+
+  // Attach the per-call token usage recorded by Codex (one `token_count` event
+  // per model request) to the step it belongs to, in order.
+  let tokenIndex = 0;
+  for (const turn of parsedTurns) {
+    for (const step of turn.steps) {
+      const stepTime = typeof step.time === 'number' ? step.time : 0;
+      while (tokenIndex < tokenCounts.length && (tokenCounts[tokenIndex].time ?? 0) < stepTime) tokenIndex += 1;
+      if (tokenIndex >= tokenCounts.length) break;
+      const usage = tokenCounts[tokenIndex].usage || {};
+      step.usage = {
+        inputTokens: Number(usage.input_tokens) || 0,
+        outputTokens: Number(usage.output_tokens) || 0,
+        totalTokens: Number(usage.total_tokens) || 0,
+        cacheReadTokens: Number(usage.cached_input_tokens) || 0,
+        cacheWriteTokens: Number(usage.cache_write_input_tokens) || 0,
+        reasoningTokens: Number(usage.reasoning_output_tokens) || 0,
+      };
+      tokenIndex += 1;
+    }
+  }
 
   const first = parsedTurns.find((turn) => turn.startTime) || null;
   meta.createdAt = meta.createdAt || (first ? first.startTime : Date.now());
@@ -751,14 +779,16 @@ function normalizeTurn(turn, index) {
 
   const steps = [];
   let current = null;
+  let pendingReasoning = '';
   const flush = () => {
-    if (current && (current.text || current.tools.length)) steps.push(current);
+    if (current && (current.text || current.tools.length || current.reasoning)) steps.push(current);
     current = null;
   };
   const ensure = (entry) => {
     if (!current) {
       current = {
         text: '',
+        reasoning: '',
         tools: [],
         time: entry.startTime ?? entry.lineTime ?? null,
         endTime: entry.endTime ?? entry.lineTime ?? null,
@@ -767,10 +797,60 @@ function normalizeTurn(turn, index) {
     return current;
   };
 
+  // Agent-team / REPL tool calls live in response_item records rather than
+  // item_completed; pair each call with its output and merge it into a step.
+  const functionOutputs = new Map();
+  for (const entry of turn.responses) {
+    const payload = entry.payload || {};
+    if (payload.type === 'function_call_output' && payload.call_id) {
+      const blocks = Array.isArray(payload.output) ? payload.output : [];
+      const text = blocks
+        .filter((block) => block && block.type === 'input_text' && typeof block.text === 'string')
+        .map((block) => block.text)
+        .join('\n');
+      functionOutputs.set(payload.call_id, {
+        text: typeof payload.output === 'string' ? payload.output : text,
+        time: entry.lineTime ?? null,
+      });
+    }
+  }
+  const extraTools = [];
+  const functionCallIds = new Set();
+  for (const entry of turn.responses) {
+    const payload = entry.payload || {};
+    if (payload.type !== 'function_call') continue;
+    if (payload.call_id) functionCallIds.add(payload.call_id);
+    const output = functionOutputs.get(payload.call_id);
+    let args = {};
+    try {
+      args = payload.arguments ? JSON.parse(payload.arguments) : {};
+    } catch {
+      args = { raw: String(payload.arguments) };
+    }
+    let name = payload.name || 'tool';
+    if (name === 'sleep') {
+      const seconds = Math.max(0, Math.round((Number(args.duration_ms) || 0) / 1000));
+      name = 'bash';
+      args = { command: `sleep ${seconds}` };
+    }
+    extraTools.push({
+      name,
+      args,
+      result: truncate(output ? output.text : '', MAX_OUTPUT_CHARS),
+      isError: false,
+      time: entry.lineTime ?? null,
+      endTime: output ? output.time ?? entry.lineTime ?? null : entry.lineTime ?? null,
+    });
+  }
+
   for (const entry of items) {
     const item = entry.item;
     if (item.type === 'Reasoning') {
-      flush();
+      const text = Array.isArray(item.summary_text) ? item.summary_text.join('\n\n').trim() : '';
+      if (text) {
+        if (current && (current.text || current.tools.length)) flush();
+        pendingReasoning = pendingReasoning ? `${pendingReasoning}\n\n${text}` : text;
+      }
       continue;
     }
     if (item.type === 'AgentMessage') {
@@ -778,16 +858,37 @@ function normalizeTurn(turn, index) {
       if (!text) continue;
       if (current && (current.text || current.tools.length)) flush();
       const step = ensure(entry);
+      if (pendingReasoning) {
+        step.reasoning = pendingReasoning;
+        pendingReasoning = '';
+      }
       step.text = text;
       step.time = entry.startTime ?? entry.lineTime ?? step.time;
       continue;
     }
-    const tools = convertTools(entry);
+    const tools = convertTools(entry, functionCallIds);
     if (!tools.length) continue;
     const step = ensure(entry);
+    if (pendingReasoning) {
+      step.reasoning = pendingReasoning;
+      pendingReasoning = '';
+    }
     for (const tool of tools) step.tools.push(tool);
   }
   flush();
+
+  for (const tool of extraTools) {
+    let target = steps.length ? steps[0] : null;
+    for (const step of steps) {
+      if ((tool.time ?? 0) >= (step.time ?? 0)) target = step;
+    }
+    if (!target) continue;
+    target.tools.push(tool);
+    target.tools.sort((left, right) => (left.time ?? 0) - (right.time ?? 0));
+    if (typeof tool.endTime === 'number' && (!target.endTime || tool.endTime > target.endTime)) {
+      target.endTime = tool.endTime;
+    }
+  }
 
   const startTime =
     turn.startTime ??
@@ -907,18 +1008,61 @@ function fileUrlToPath(url) {
 
 function truncate(text, max) {
   const value = String(text ?? '');
-  if (value.length <= max) return value;
-  const head = value.slice(0, max);
-  return `${head}\n… (${value.length} 字符，已截断)`;
+  return value.length <= max ? value : value.slice(0, max);
 }
 
-function convertTools(entry) {
+function jsonArguments(value) {
+  if (typeof value === 'string') return { raw: value };
+  if (value && typeof value === 'object') return value;
+  return {};
+}
+
+function nativeWriteResult(filePath) {
+  return `<path>${filePath}</path>\n<type>file</type>\n<content>\nCreated file\n</content>`;
+}
+
+function nativeEditResult(filePath) {
+  return `The file ${filePath} has been updated successfully.`;
+}
+
+function diffHunks(diff) {
+  const lines = String(diff ?? '').split('\n');
+  const hunks = [];
+  let current = null;
+  for (const line of lines) {
+    if (line.startsWith('@@')) {
+      if (current) hunks.push(current);
+      current = { oldLines: [], newLines: [] };
+      continue;
+    }
+    if (!current) continue;
+    if (line.startsWith('---') || line.startsWith('+++') || line.startsWith('\\')) continue;
+    if (line.startsWith(' ')) {
+      current.oldLines.push(line.slice(1));
+      current.newLines.push(line.slice(1));
+    } else if (line.startsWith('-')) current.oldLines.push(line.slice(1));
+    else if (line.startsWith('+')) current.newLines.push(line.slice(1));
+  }
+  if (current) hunks.push(current);
+  return hunks
+    .filter((hunk) => hunk.oldLines.length || hunk.newLines.length)
+    .map((hunk) => ({
+      oldText: truncate(hunk.oldLines.join('\n'), MAX_FILE_CHARS),
+      newText: truncate(hunk.newLines.join('\n'), MAX_FILE_CHARS),
+    }));
+}
+
+function convertTools(entry, skipMcpIds) {
   const item = entry.item;
   const time = entry.startTime ?? entry.lineTime ?? null;
   const endTime = entry.endTime ?? (time != null ? time + 1 : null);
   if (item.type === 'CommandExecution') return [convertCommand(item, entry, time, endTime)];
   if (item.type === 'FileChange') return convertFileChanges(item, time, endTime);
   if (item.type === 'Extension') return convertExtension(item, time, endTime);
+  if (item.type === 'McpToolCall') {
+    if (skipMcpIds && skipMcpIds.has(item.id)) return [];
+    return convertMcpTool(item, time, endTime);
+  }
   return [];
 }
 
@@ -932,11 +1076,7 @@ function convertCommand(item, entry, time, endTime) {
   } else if (typeof item.command === 'string') {
     command = item.command;
   }
-  let output = typeof item.aggregated_output === 'string' ? item.aggregated_output : '';
-  if (typeof item.exit_code === 'number' && item.exit_code !== 0) {
-    if (output && !output.endsWith('\n')) output += '\n';
-    output += `[exit code: ${item.exit_code}]\n`;
-  }
+  const output = typeof item.aggregated_output === 'string' ? item.aggregated_output : '';
   const cwd = fileUrlToPath(item.cwd);
   return {
     name: 'bash',
@@ -959,25 +1099,66 @@ function convertFileChanges(item, time, endTime) {
       tools.push({
         name: 'write',
         args: { file_path: filePath, content: truncate(content, MAX_FILE_CHARS) },
-        result: `Wrote ${filePath} (${Buffer.byteLength(content)} bytes)`,
+        result: nativeWriteResult(filePath),
         isError: false,
         time,
         endTime,
       });
     } else if (change.type === 'update' && typeof change.unified_diff === 'string') {
-      const hunk = firstDiffHunk(change.unified_diff);
-      tools.push({
-        name: 'edit',
-        args: { file_path: filePath, old_string: hunk.oldText, new_string: hunk.newText },
-        result: `Edited ${filePath}`,
-        isError: false,
-        time,
-        endTime,
-      });
+      for (const hunk of diffHunks(change.unified_diff)) {
+        tools.push({
+          name: 'edit',
+          args: { file_path: filePath, old_string: hunk.oldText, new_string: hunk.newText },
+          result: nativeEditResult(filePath),
+          isError: false,
+          time,
+          endTime,
+        });
+      }
     }
-    if (tools.length >= 6) break;
   }
   return tools;
+}
+
+function convertMcpTool(item, time, endTime) {
+  if (item.status && item.status !== 'completed') return [];
+  const server = item.server || 'mcp';
+  const tool = item.tool || 'tool';
+  const content = item.result && Array.isArray(item.result.content) ? item.result.content : [];
+  const text = content
+    .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text)
+    .join('\n\n');
+  const duration = item.duration && typeof item.duration === 'object'
+    ? Math.max(1, Math.round((Number(item.duration.secs) || 0) * 1000 + (Number(item.duration.nanos) || 0) / 1e6))
+    : null;
+  return [{
+    name: `mcp__${server}__${tool}`,
+    args: jsonArguments(item.arguments),
+    result: truncate(text, MAX_OUTPUT_CHARS),
+    isError: Boolean(item.result && item.result.isError),
+    time,
+    endTime: duration !== null && typeof time === 'number' ? time + duration : endTime,
+  }];
+}
+
+function functionCallTool(entry) {
+  const payload = entry.payload || {};
+  if (payload.type !== 'function_call') return null;
+  const name = payload.name || 'tool';
+  let args = {};
+  try {
+    args = payload.arguments ? JSON.parse(payload.arguments) : {};
+  } catch {
+    args = { raw: String(payload.arguments) };
+  }
+  return {
+    name,
+    args,
+    output: payload.call_id,
+    time: entry.lineTime ?? null,
+    endTime: entry.lineTime ?? null,
+  };
 }
 
 function firstDiffHunk(diff) {
@@ -1011,6 +1192,10 @@ function convertExtension(item, time, endTime) {
   if (item.kind === 'web.search') {
     const query = item.query || action.query || '';
     return [{ name: 'web_search', args: { queries: [String(query)] }, result: resultText, isError: false, time, endTime }];
+  }
+  if (item.kind === 'clock.sleep') {
+    const seconds = Math.max(0, Math.round((Number(item.durationMs) || 0) / 1000));
+    return [{ name: 'bash', args: { command: `sleep ${seconds}` }, result: '', isError: false, time, endTime }];
   }
   return [];
 }
@@ -1118,6 +1303,9 @@ function buildEvents(parsed, options) {
 
       const tools = options.includeToolCalls ? step.tools : [];
       const content = [];
+      if (step.reasoning) {
+        content.push({ type: 'reasoning', text: options.rebrandText ? rebrandText(step.reasoning) : step.reasoning });
+      }
       if (step.text) content.push({ type: 'text', text: options.rebrandText ? rebrandText(step.text) : step.text });
       const callIds = tools.map(() => callId());
       tools.forEach((tool, index) => {
@@ -1141,6 +1329,7 @@ function buildEvents(parsed, options) {
               id: messageId(),
             },
             stream: [],
+            ...(step.usage ? { usage: step.usage } : {}),
           },
           stepTime,
           { surfaceOp: 'append' },
