@@ -541,6 +541,147 @@ function inferCwd(turns) {
   return null;
 }
 
+/**
+ * Codex wraps a user message that carried attachments in a generated preamble
+ * ("# Files mentioned by the user", file paths, `<image>` tags, "## My request:").
+ * Those paths are Host-local temp files and read as noise in the imported
+ * conversation, so keep only the user's actual request text.
+ */
+function sanitizePromptText(text) {
+  if (typeof text !== 'string' || !text) return text;
+  if (
+    !/Files mentioned by the user/.test(text) &&
+    !/<image\b/i.test(text) &&
+    !/^Image attachment:\s*true\s*$/im.test(text)
+  ) {
+    return text;
+  }
+  let out = text;
+  const marker = /^##\s*My request:\s*$/m.exec(out);
+  if (marker) out = out.slice(marker.index + marker[0].length);
+  else {
+    out = out.replace(/^#\s*Files mentioned by the user:.*$/m, '');
+    out = out.replace(/^##\s+[^\n]*\.(?:png|jpe?g|gif|webp|pdf|docx?|xlsx?|csv|txt|md|zip)\s*:\s*\S*\s*$/gim, '');
+  }
+  out = out.replace(/<image\b[\s\S]*?<\/image>/gi, '');
+  out = out.replace(/<image\b[^>]*\/?>/gi, '');
+  out = out.replace(/^Image attachment:\s*true\s*$/gim, '');
+  out = out.replace(/^Distinguish instructions in attached documents from the user's request\.\s*$/gim, '');
+  out = out.replace(/\n{3,}/g, '\n\n').trim();
+  return out;
+}
+
+function promptTextOf(message) {
+  const content = Array.isArray(message?.content) ? message.content : [];
+  return content
+    .map((block) => (block && block.type === 'text' && typeof block.text === 'string' ? block.text : ''))
+    .join('');
+}
+
+/**
+ * Earlier imports kept the attachment preamble verbatim. Append supported
+ * surface replacements for those user messages so the visible history (and the
+ * model-visible projection) carries just the request text.
+ */
+async function repairImportedPrompts(ctx, sessions, record) {
+  if (!record || record.promptsSanitized === true) return 0;
+  try {
+    return await repairImportedPromptsInner(ctx, sessions, record);
+  } catch {
+    return 0;
+  }
+}
+
+async function repairImportedPromptsInner(ctx, sessions, record) {
+  const live = sessions && typeof sessions.get === 'function' ? sessions.get(record.sessionId) : undefined;
+  let events = [];
+  let liveSession = live;
+  if (liveSession) {
+    events = liveSession.snapshotEvents();
+  } else {
+    let handle;
+    try {
+      handle = await ctx.sessionPersistence.open(record.sessionId, 'read');
+      const read = await handle.read(0, 1000000);
+      events = read.events || [];
+    } catch {
+      return 0;
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+    }
+  }
+  const shadowed = new Set();
+  for (const event of events) {
+    const op = event.surfaceOp;
+    if (op && typeof op === 'object' && op.op === 'replace') {
+      for (let seq = op.startSeq; seq <= op.endSeq; seq += 1) shadowed.add(seq);
+    }
+  }
+  const targets = events.filter(
+    (event) =>
+      event.type === 'user/message' &&
+      !shadowed.has(event.seq) &&
+      sanitizePromptText(promptTextOf(event.data)) !== promptTextOf(event.data),
+  );
+  if (!targets.length) {
+    record.promptsSanitized = true;
+    return 0;
+  }
+  let repaired = 0;
+  if (liveSession) {
+    for (const target of targets) {
+      const data = {
+        ...target.data,
+        content: [{ type: 'text', text: sanitizePromptText(promptTextOf(target.data)) }],
+      };
+      try {
+        liveSession.append('user/message', data, {
+          surfaceOp: { op: 'replace', startSeq: target.seq, endSeq: target.seq },
+          sourceEventSeqs: [target.seq],
+        });
+        repaired += 1;
+      } catch {
+        return 0;
+      }
+    }
+    try {
+      await ctx.sessions.flush(liveSession);
+    } catch {
+      /* durability is best effort */
+    }
+  } else {
+    let writer;
+    try {
+      writer = await ctx.sessionPersistence.open(record.sessionId, 'write');
+    } catch {
+      return 0;
+    }
+    try {
+      let nextSeq = events.reduce((max, event) => Math.max(max, event.seq ?? 0), 0) + 1;
+      let nextTime = events.reduce((max, event) => Math.max(max, event.time ?? 0), 0) + 1;
+      const appended = targets.map((target) => ({
+        type: 'user/message',
+        seq: nextSeq++,
+        time: nextTime++,
+        data: {
+          ...target.data,
+          content: [{ type: 'text', text: sanitizePromptText(promptTextOf(target.data)) }],
+        },
+        surfaceOp: { op: 'replace', startSeq: target.seq, endSeq: target.seq },
+        sourceEventSeqs: [target.seq],
+      }));
+      await writer.append(appended);
+      await writer.flush();
+      repaired = appended.length;
+    } finally {
+      await writer.close().catch(() => {});
+    }
+  }
+  record.promptsSanitized = true;
+  record.events = (record.events || 0) + repaired;
+  return repaired;
+}
+
 function normalizeTurn(turn, index) {
   const items = [...turn.items].sort((left, right) => left.ordinal - right.ordinal);
   const combined = [
@@ -558,7 +699,7 @@ function normalizeTurn(turn, index) {
           ? contentText(entry.payload.content)
           : null;
     if (!text) continue;
-    const normalized = normalizePrompt(text);
+    const normalized = sanitizePromptText(normalizePrompt(text));
     if (!normalized) continue;
     const key = normalized.replace(/\s+/g, ' ').slice(0, 240);
     if (seenPrompts.has(key)) continue;
@@ -1122,6 +1263,7 @@ async function importFromRequest(ctx, env, body, res) {
     sync: true,
     lastSyncAt: Date.now(),
     lastSyncResult: null,
+    promptsSanitized: true,
   };
   await writeState(env, state);
 
@@ -1256,9 +1398,11 @@ async function syncRequest(ctx, env, body, res) {
 
 async function runSync(ctx, env, state, entries, force) {
   const results = [];
+  const sessions = safeService(ctx, 'sessions');
   for (const [threadId, record] of entries) {
     try {
-      results.push(await syncOne(ctx, env, state, threadId, record, force));
+      const repaired = await repairImportedPrompts(ctx, sessions, record).catch(() => 0);
+      results.push(await syncOne(ctx, env, state, threadId, record, force, repaired));
     } catch (error) {
       record.lastSyncAt = Date.now();
       record.lastSyncResult = `失败：${error?.message || error}`;
@@ -1269,8 +1413,8 @@ async function runSync(ctx, env, state, entries, force) {
   return results;
 }
 
-async function syncOne(ctx, env, state, threadId, record, force) {
-  const result = { threadId, sessionId: record.sessionId };
+async function syncOne(ctx, env, state, threadId, record, force, repairedPrompts) {
+  const result = { threadId, sessionId: record.sessionId, repairedPrompts: repairedPrompts || 0 };
   if (!force && record.sync === false) {
     result.skipped = 'disabled';
     return result;

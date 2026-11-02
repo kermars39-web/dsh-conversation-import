@@ -92,7 +92,9 @@ Restart or reload the page after installing; the entry appears under the sidebar
 ## Known limitations
 
 - Import is a snapshot; the last (still generating) turn is imported by a later sync.
-- Images and file attachments in the source thread are not imported.
+- Images and file attachments in the source thread are not imported; the generated attachment preamble
+  (file lists, `<image>` tags, temp paths) is stripped from user messages, and earlier imported sessions
+  are repaired in place with a surface replacement.
 - Threads split across several rollout files use the newest segment; multi-segment merging is planned.
 - An already-open Session does not stream appended turns; reopen it or refresh the list to see them.
 - Windows is untested.
