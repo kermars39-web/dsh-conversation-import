@@ -702,6 +702,34 @@ async function persistPromptImages(ctx, turns) {
   if (!attachments || typeof attachments.saveImage !== 'function') return 0;
   let saved = 0;
   for (const turn of turns || []) {
+    for (const step of turn.steps || []) {
+      for (const tool of step.tools || []) {
+        const images = Array.isArray(tool.images) ? tool.images : [];
+        if (!images.length) continue;
+        const blocks = [];
+        for (const image of images) {
+          try {
+            let bytes = image.bytes;
+            let mediaType = image.mediaType;
+            let name;
+            if (image.kind === 'path') {
+              bytes = await fsp.readFile(image.path);
+              name = path.basename(image.path);
+            }
+            if (!bytes || !bytes.length) continue;
+            mediaType = mediaType || sniffImageMediaType(bytes);
+            if (!mediaType) continue;
+            const ref = await attachments.saveImage({ data: new Uint8Array(bytes), mediaType, name });
+            blocks.push({ type: 'image', attachment: ref });
+            saved += 1;
+          } catch {
+            /* skip images the store refuses */
+          }
+        }
+        tool.imageBlocks = blocks;
+        delete tool.images;
+      }
+    }
     for (const prompt of turn.prompts || []) {
       const images = prompt.images || [];
       if (!images.length) continue;
@@ -1059,6 +1087,20 @@ function convertTools(entry, skipMcpIds) {
   if (item.type === 'CommandExecution') return [convertCommand(item, entry, time, endTime)];
   if (item.type === 'FileChange') return convertFileChanges(item, time, endTime);
   if (item.type === 'Extension') return convertExtension(item, time, endTime);
+  if (item.type === 'ImageView') {
+    const raw = typeof item.path === 'string' ? item.path : '';
+    const filePath = fileUrlToPath(raw) || raw;
+    if (!filePath) return [];
+    return [{
+      name: 'read_image',
+      args: { file_path: filePath },
+      result: `<path>${filePath}</path>`,
+      images: [{ kind: 'path', path: filePath }],
+      isError: false,
+      time,
+      endTime,
+    }];
+  }
   if (item.type === 'McpToolCall') {
     if (skipMcpIds && skipMcpIds.has(item.id)) return [];
     return convertMcpTool(item, time, endTime);
@@ -1349,6 +1391,11 @@ function buildEvents(parsed, options) {
         );
       });
       tools.forEach((tool, index) => {
+        const toolContent = [];
+        const toolText = tool.result || '';
+        if (toolText) toolContent.push({ type: 'text', text: toolText });
+        for (const block of tool.imageBlocks || []) toolContent.push(block);
+        if (!toolContent.length) toolContent.push({ type: 'text', text: '' });
         const data = {
           turn: turnNumber,
           step: stepNumber,
@@ -1356,7 +1403,7 @@ function buildEvents(parsed, options) {
             role: 'tool',
             source: { kind: 'tool', callId: callIds[index] },
             toolCallId: callIds[index],
-            content: [{ type: 'text', text: tool.result || '' }],
+            content: toolContent,
             id: messageId(),
           },
         };
